@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useState } from "react";
@@ -8,8 +9,12 @@ import { hashFile } from "@/lib/hash";
 const CONTRACT_ADDRESS =
   "0xDD31b39B863E58C7e5a0001B95d3A876fa3220bd";
 
+const IPFS_GATEWAY = "https://gateway.pinata.cloud/ipfs/";
+
+type Tab = "issuer" | "holder" | "verifier";
+
 export default function Home() {
-  const [activeTab, setActiveTab] = useState("issuer");
+  const [activeTab, setActiveTab] = useState<Tab>("issuer");
 
   // Wallet
   const [walletAddress, setWalletAddress] = useState("");
@@ -21,13 +26,15 @@ export default function Home() {
   const [issuerFile, setIssuerFile] = useState<File | null>(null);
   const [issuing, setIssuing] = useState(false);
   const [issueSuccess, setIssueSuccess] = useState("");
+  const [ipfsCid, setIpfsCid] = useState("");
+  const [documentHashValue, setDocumentHashValue] = useState("");
 
   // Holder
   const [verifierAddress, setVerifierAddress] = useState("");
   const [consentLoading, setConsentLoading] = useState(false);
   const [consentMessage, setConsentMessage] = useState("");
 
-  // Shared transaction
+  // Transactions
   const [transactionHash, setTransactionHash] = useState("");
 
   // Verifier
@@ -37,49 +44,33 @@ export default function Home() {
   const [verificationResult, setVerificationResult] =
     useState<boolean | null>(null);
 
-  // =========================
-  // Connect MetaMask
-  // =========================
   async function handleConnectWallet() {
     try {
       setConnecting(true);
       setError("");
 
       const result = await connectWallet();
-
       setWalletAddress(result.address);
     } catch (err) {
-      console.error(err);
-
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to connect wallet.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to connect wallet."
+      );
     } finally {
       setConnecting(false);
     }
   }
 
-  // =========================
-  // Issuer
-  // =========================
+  // ISSUER: hash document, upload to IPFS, issue hash on-chain.
   async function handleIssueCredential() {
     try {
       setError("");
       setIssueSuccess("");
       setTransactionHash("");
+      setIpfsCid("");
+      setDocumentHashValue("");
 
-      if (!holderAddress) {
-        throw new Error(
-          "Please enter the holder wallet address."
-        );
-      }
-
-      if (!isAddress(holderAddress)) {
-        throw new Error(
-          "Please enter a valid Ethereum wallet address."
-        );
+      if (!holderAddress || !isAddress(holderAddress)) {
+        throw new Error("Please enter a valid Holder wallet address.");
       }
 
       if (!issuerFile) {
@@ -89,179 +80,136 @@ export default function Home() {
       setIssuing(true);
 
       const { signer, address } = await connectWallet();
-
       setWalletAddress(address);
 
-      // Hash document in browser
+      // 1. Calculate Keccak-256 over the exact document bytes.
       const documentHash = await hashFile(issuerFile);
+      setDocumentHashValue(documentHash);
 
-      console.log(
-        "Issuer document hash:",
-        documentHash
-      );
+      // 2. Upload the document to Pinata through our server API.
+      const formData = new FormData();
+      formData.append("file", issuerFile);
 
+      const uploadResponse = await fetch("/api/pinata/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      const uploadResult = await uploadResponse.json();
+
+      if (!uploadResponse.ok) {
+        throw new Error(uploadResult.error || "IPFS upload failed.");
+      }
+
+      if (!uploadResult.cid) {
+        throw new Error("Pinata did not return an IPFS CID.");
+      }
+
+      setIpfsCid(uploadResult.cid);
+
+      // 3. Store the hash on the existing Sepolia smart contract.
       const contract = await getContract(signer);
-
       const transaction = await contract.issueCredential(
         holderAddress,
         documentHash
       );
 
       setTransactionHash(transaction.hash);
-
       await transaction.wait();
 
       setIssueSuccess(
-        "Credential successfully issued on the Sepolia blockchain."
+        "Credential issued successfully. Document uploaded to IPFS."
       );
     } catch (err) {
       console.error(err);
-
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Failed to issue credential.");
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to issue credential."
+      );
     } finally {
       setIssuing(false);
     }
   }
 
-  // =========================
-  // Holder Consent
-  // =========================
-  async function handleConsent(
-    consentGiven: boolean
-  ) {
+  // HOLDER: grant or revoke verifier consent.
+  async function handleConsent(consentGiven: boolean) {
     try {
       setError("");
       setConsentMessage("");
       setTransactionHash("");
 
-      if (!verifierAddress) {
-        throw new Error(
-          "Please enter the verifier wallet address."
-        );
-      }
-
-      if (!isAddress(verifierAddress)) {
-        throw new Error(
-          "Please enter a valid Ethereum wallet address."
-        );
+      if (!verifierAddress || !isAddress(verifierAddress)) {
+        throw new Error("Please enter a valid Verifier wallet address.");
       }
 
       setConsentLoading(true);
 
-      const { signer, address } =
-        await connectWallet();
-
+      const { signer, address } = await connectWallet();
       setWalletAddress(address);
 
       const contract = await getContract(signer);
-
-      const transaction =
-        await contract.setConsent(
-          verifierAddress,
-          consentGiven
-        );
+      const transaction = await contract.setConsent(
+        verifierAddress,
+        consentGiven
+      );
 
       setTransactionHash(transaction.hash);
-
       await transaction.wait();
 
       setConsentMessage(
         consentGiven
-          ? "Consent successfully granted to the verifier."
-          : "Consent successfully revoked from the verifier."
+          ? "Consent successfully granted to the Verifier."
+          : "Consent successfully revoked from the Verifier."
       );
     } catch (err) {
       console.error(err);
-
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError(
-          "Failed to update consent."
-        );
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to update consent."
+      );
     } finally {
       setConsentLoading(false);
     }
   }
 
-  // =========================
-  // Verifier
-  // =========================
+  // VERIFIER: hash the supplied document and ask the contract to validate it.
   async function handleVerifyCredential() {
     try {
       setError("");
+      setTransactionHash("");
       setVerificationResult(null);
 
-      if (!verifyHolderAddress) {
-        throw new Error(
-          "Please enter the holder wallet address."
-        );
-      }
-
-      if (!isAddress(verifyHolderAddress)) {
-        throw new Error(
-          "Please enter a valid holder wallet address."
-        );
+      if (!verifyHolderAddress || !isAddress(verifyHolderAddress)) {
+        throw new Error("Please enter a valid Holder wallet address.");
       }
 
       if (!verifierFile) {
-        throw new Error(
-          "Please select the document to verify."
-        );
+        throw new Error("Please select the document to verify.");
       }
 
       setVerifying(true);
 
-      // Connect using the Verifier account
-      const { signer, address } =
-        await connectWallet();
-
+      const { signer, address } = await connectWallet();
       setWalletAddress(address);
 
-      // Hash document in browser
-      const documentHash =
-        await hashFile(verifierFile);
+      // Must use the same Keccak-256 function used by the Issuer.
+      const documentHash = await hashFile(verifierFile);
+      const contract = await getContract(signer);
 
-      console.log(
-        "Verifier document hash:",
+      const valid = await contract.isValid(
+        verifyHolderAddress,
         documentHash
       );
 
-      const contract =
-        await getContract(signer);
-
-      // The connected wallet becomes msg.sender.
-      // Therefore consent is checked for this verifier.
-      const valid =
-        await contract.isValid(
-          verifyHolderAddress,
-          documentHash
-        );
-
-      setVerificationResult(valid);
+      setVerificationResult(Boolean(valid));
     } catch (err) {
       console.error(err);
-
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError(
-          "Failed to verify credential."
-        );
-      }
+      setError(
+        err instanceof Error ? err.message : "Failed to verify credential."
+      );
     } finally {
       setVerifying(false);
     }
   }
 
-  // =========================
-  // Reset messages
-  // =========================
   function resetMessages() {
     setError("");
     setConsentMessage("");
@@ -270,247 +218,110 @@ export default function Home() {
     setTransactionHash("");
   }
 
-  const tabs = [
+  const tabs: { id: Tab; number: string; label: string; description: string }[] = [
     {
       id: "issuer",
-      label: "Issuer",
       number: "01",
+      label: "Issuer",
       description: "Issue credential",
     },
     {
       id: "holder",
-      label: "Holder",
       number: "02",
+      label: "Holder",
       description: "Manage consent",
     },
     {
       id: "verifier",
-      label: "Verifier",
       number: "03",
+      label: "Verifier",
       description: "Verify document",
     },
   ];
 
   return (
     <main className="min-h-screen bg-[#070b14] text-white">
-
-      {/* =========================
-          HEADER
-      ========================= */}
       <header className="sticky top-0 z-20 border-b border-white/10 bg-[#070b14]/90 backdrop-blur-xl">
-
         <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4 sm:px-8">
-
-          <div className="flex items-center gap-3">
-
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 shadow-lg shadow-blue-600/20">
-              <span className="text-lg font-black">
-                K
-              </span>
-            </div>
-
-            <div>
-              <h1 className="text-base font-bold tracking-tight sm:text-lg">
-                e-KYC & Consent Vault
-              </h1>
-
-              <p className="text-xs text-slate-400">
-                Decentralized document verification
-              </p>
-            </div>
-
+          <div>
+            <h1 className="text-lg font-bold">e-KYC &amp; Consent Vault</h1>
+            <p className="text-xs text-slate-400">
+              Decentralized document verification
+            </p>
           </div>
 
           <button
             onClick={handleConnectWallet}
             disabled={connecting}
-            className="rounded-xl border border-blue-500/30 bg-blue-600/10 px-4 py-2.5 text-sm font-semibold text-blue-300 transition hover:bg-blue-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded-xl border border-blue-500/30 bg-blue-600/10 px-4 py-2.5 text-sm font-semibold text-blue-300 hover:bg-blue-600 hover:text-white disabled:opacity-60"
           >
             {connecting
               ? "Connecting..."
               : walletAddress
-                ? `${walletAddress.slice(
-                    0,
-                    6
-                  )}...${walletAddress.slice(-4)}`
+                ? `${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
                 : "Connect MetaMask"}
           </button>
-
         </div>
-
       </header>
 
-      {/* =========================
-          MAIN
-      ========================= */}
-      <section className="mx-auto max-w-7xl px-5 py-10 sm:px-8 sm:py-14">
+      <section className="mx-auto max-w-7xl px-5 py-10 sm:px-8">
+        <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-blue-600/15 via-slate-900 to-purple-600/10 p-7 sm:p-10">
+          <span className="rounded-full border border-green-500/20 bg-green-500/10 px-3 py-1.5 text-xs font-semibold text-green-300">
+            Sepolia Testnet
+          </span>
 
-        {/* =========================
-            HERO
-        ========================= */}
-        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-blue-600/15 via-slate-900 to-purple-600/10 p-7 sm:p-10">
+          <h2 className="mt-5 text-4xl font-black sm:text-5xl">
+            Secure digital credentials.
+            <span className="block text-blue-400">Verify with consent.</span>
+          </h2>
 
-          <div className="absolute -right-24 -top-24 h-64 w-64 rounded-full bg-blue-600/10 blur-3xl" />
+          <p className="mt-5 max-w-2xl text-sm leading-7 text-slate-400">
+            Documents are uploaded to IPFS. Their Keccak-256 fingerprints
+            are stored on the blockchain, while Holders control verifier
+            consent.
+          </p>
 
-          <div className="absolute -bottom-24 left-1/3 h-64 w-64 rounded-full bg-purple-600/10 blur-3xl" />
-
-          <div className="relative max-w-3xl">
-
-            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-green-500/20 bg-green-500/10 px-3 py-1.5 text-xs font-semibold text-green-300">
-
-              <span className="h-2 w-2 rounded-full bg-green-400" />
-
-              Sepolia Testnet
-
-            </div>
-
-            <h2 className="text-4xl font-black tracking-tight sm:text-5xl">
-
-              Secure digital credentials.
-
-              <span className="block text-blue-400">
-                Verify with consent.
-              </span>
-
-            </h2>
-
-            <p className="mt-5 max-w-2xl text-sm leading-7 text-slate-400 sm:text-base">
-
-              Store only the document fingerprint on-chain.
-              The Holder controls who can verify the
-              credential, while the Verifier checks the
-              document directly in the browser.
-
-            </p>
-
-            <div className="mt-7 flex flex-wrap gap-3 text-xs text-slate-300">
-
-              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
-                SHA-256 Hashing
-              </span>
-
-              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
-                Ethereum Sepolia
-              </span>
-
-              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
-                Holder Consent
-              </span>
-
-            </div>
-
-          </div>
-
-        </div>
-
-        {/* =========================
-            WORKFLOW
-        ========================= */}
-        <div className="my-8 grid gap-3 sm:grid-cols-3">
-
-          {[
-            [
-              "01",
-              "Issue",
-              "Issuer stores the document hash.",
-            ],
-            [
-              "02",
-              "Consent",
-              "Holder controls verifier access.",
-            ],
-            [
-              "03",
-              "Verify",
-              "Verifier checks hash + consent.",
-            ],
-          ].map(
-            ([number, title, description]) => (
-
-              <div
-                key={number}
-                className="rounded-2xl border border-white/10 bg-slate-900/70 p-5"
-              >
-
-                <div className="mb-3 flex items-center gap-3">
-
-                  <span className="text-xs font-bold text-blue-400">
-                    {number}
-                  </span>
-
-                  <h3 className="font-semibold">
-                    {title}
-                  </h3>
-
-                </div>
-
-                <p className="text-sm leading-6 text-slate-400">
-                  {description}
-                </p>
-
-              </div>
-
-            )
-          )}
-
-        </div>
-
-        {/* =========================
-            CONTRACT
-        ========================= */}
-        <div className="mb-8 rounded-2xl border border-white/10 bg-slate-900/70 p-5 sm:p-6">
-
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-
-            <div>
-
-              <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Deployed Smart Contract
-              </p>
-
-              <p className="mt-2 break-all font-mono text-xs text-blue-300 sm:text-sm">
-                {CONTRACT_ADDRESS}
-              </p>
-
-            </div>
-
-            <a
-              href={`https://sepolia.etherscan.io/address/${CONTRACT_ADDRESS}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="shrink-0 rounded-lg border border-white/10 px-4 py-2 text-sm font-medium text-slate-300 transition hover:border-blue-500/40 hover:text-white"
-            >
-              View on Etherscan ↗
-            </a>
-
-          </div>
-
-        </div>
-
-        {/* =========================
-            ERROR
-        ========================= */}
-        {error && (
-
-          <div className="mb-6 rounded-2xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
-
-            <span className="mr-2 font-bold">
-              !
+          <div className="mt-6 flex flex-wrap gap-3 text-xs text-slate-300">
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
+              Keccak-256 Hashing
             </span>
-
-            {error}
-
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
+              Pinata IPFS
+            </span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
+              Ethereum Sepolia
+            </span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2">
+              Holder Consent
+            </span>
           </div>
+        </div>
 
+        <div className="my-8 rounded-2xl border border-white/10 bg-slate-900/70 p-5">
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+            Deployed Smart Contract
+          </p>
+          <p className="mt-2 break-all font-mono text-sm text-blue-300">
+            {CONTRACT_ADDRESS}
+          </p>
+          <a
+            href={`https://sepolia.etherscan.io/address/${CONTRACT_ADDRESS}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-3 inline-block text-sm text-blue-400 underline"
+          >
+            View on Etherscan
+          </a>
+        </div>
+
+        {error && (
+          <div className="mb-6 rounded-2xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
+            {error}
+          </div>
         )}
 
-        {/* =========================
-            TABS
-        ========================= */}
         <div className="mb-6 grid grid-cols-3 gap-2 rounded-2xl border border-white/10 bg-slate-900/80 p-2">
-
           {tabs.map((tab) => (
-
             <button
               key={tab.id}
               onClick={() => {
@@ -519,519 +330,330 @@ export default function Home() {
               }}
               className={`rounded-xl px-3 py-3 text-left transition sm:px-5 ${
                 activeTab === tab.id
-                  ? "bg-blue-600 shadow-lg shadow-blue-600/20"
+                  ? "bg-blue-600"
                   : "hover:bg-white/5"
               }`}
             >
-
               <div className="text-[10px] font-bold opacity-70">
                 {tab.number}
               </div>
-
               <div className="mt-1 text-sm font-bold sm:text-base">
                 {tab.label}
               </div>
-
-              <div className="mt-0.5 hidden text-xs opacity-70 sm:block">
+              <div className="mt-1 hidden text-xs opacity-70 sm:block">
                 {tab.description}
               </div>
-
             </button>
-
           ))}
-
         </div>
 
-        {/* =========================
-            ROLE CARD
-        ========================= */}
-        <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-2xl shadow-black/20 sm:p-8">
-
-          {/* =========================
-              ISSUER
-          ========================= */}
+        <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-2xl sm:p-8">
+          {/* ISSUER */}
           {activeTab === "issuer" && (
-
-            <>
-
-              <div className="mb-8">
-
-                <div className="mb-3 inline-flex rounded-lg bg-blue-500/10 px-3 py-1.5 text-xs font-semibold text-blue-300">
-                  ROLE 01 · ISSUER
-                </div>
-
-                <h3 className="text-2xl font-bold">
-                  Issue a credential
-                </h3>
-
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-
-                  Hash the document in the browser and store
-                  its fingerprint on the Sepolia blockchain
-                  for the selected Holder.
-
-                </p>
-
-              </div>
+            <div>
+              <RoleHeading
+                label="ROLE 01 · ISSUER"
+                title="Issue a credential"
+                description="Upload the document to IPFS and record its Keccak-256 fingerprint on Sepolia."
+              />
 
               <div className="space-y-5">
-
-                {/* Holder address */}
-                <div>
-
-                  <label className="mb-2 block text-sm font-semibold text-slate-300">
-                    Holder Wallet Address
-                  </label>
-
+                <Field label="Holder Wallet Address">
                   <input
                     type="text"
                     value={holderAddress}
-                    onChange={(e) =>
-                      setHolderAddress(
-                        e.target.value
-                      )
-                    }
+                    onChange={(e) => setHolderAddress(e.target.value)}
                     placeholder="0x..."
-                    className="w-full rounded-xl border border-white/10 bg-[#070b14] px-4 py-3.5 font-mono text-sm outline-none transition placeholder:text-slate-600 focus:border-blue-500/70 focus:ring-2 focus:ring-blue-500/10"
+                    className={inputClass}
                   />
+                </Field>
 
-                </div>
+                <Field label="Document to Issue">
+                  <input
+                    type="file"
+                    onChange={(e) => {
+                      setIssuerFile(e.target.files?.[0] ?? null);
+                      setIpfsCid("");
+                      setDocumentHashValue("");
+                      setIssueSuccess("");
+                    }}
+                    className={fileClass}
+                  />
+                  <p className="mt-2 text-xs text-slate-500">
+                    The document will be uploaded to IPFS. Do not use
+                    unencrypted sensitive identity documents.
+                  </p>
+                </Field>
 
-                {/* Document */}
-                <div>
-
-                  <label className="mb-2 block text-sm font-semibold text-slate-300">
-                    Document
-                  </label>
-
-                  <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-[#070b14] px-5 py-8 text-center transition hover:border-blue-500/50 hover:bg-blue-500/5">
-
-                    <span className="text-2xl">
-                      ↑
-                    </span>
-
-                    <span className="mt-2 text-sm font-semibold text-slate-200">
-                      {issuerFile
-                        ? issuerFile.name
-                        : "Choose a document"}
-                    </span>
-
-                    <span className="mt-1 text-xs text-slate-500">
-
-                      The file stays in your browser;
-                      only its hash is stored on-chain.
-
-                    </span>
-
-                    <input
-                      type="file"
-                      onChange={(e) =>
-                        setIssuerFile(
-                          e.target.files?.[0] ||
-                            null
-                        )
-                      }
-                      className="hidden"
-                    />
-
-                  </label>
-
-                </div>
-
-                {/* Issue button */}
                 <button
-                  onClick={
-                    handleIssueCredential
-                  }
+                  onClick={handleIssueCredential}
                   disabled={issuing}
-                  className="w-full rounded-xl bg-blue-600 px-5 py-3.5 font-semibold transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+                  className={primaryButton}
                 >
-
-                  {issuing
-                    ? "Issuing Credential..."
-                    : "Issue Credential"}
-
+                  {issuing ? "Uploading / Issuing..." : "Upload & Issue Credential"}
                 </button>
 
-                {/* Success */}
-                {issueSuccess && (
-
-                  <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4 text-sm text-green-300">
-
-                    ✓ {issueSuccess}
-
-                  </div>
-
-                )}
-
-                {/* Transaction */}
-                {transactionHash && (
-                  <TransactionBox
-                    hash={transactionHash}
+                {documentHashValue && (
+                  <ResultField
+                    label="Keccak-256 Document Hash"
+                    value={documentHashValue}
                   />
                 )}
 
+                {ipfsCid && (
+                  <div className="break-words rounded-xl border border-blue-500/20 bg-blue-500/5 p-4">
+                    <p className="text-xs font-semibold uppercase text-blue-300">
+                      IPFS Content Identifier (CID)
+                    </p>
+                    <p className="mt-2 font-mono text-sm">{ipfsCid}</p>
+                    <a
+                      href={`${IPFS_GATEWAY}${encodeURIComponent(ipfsCid)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mt-3 inline-block text-sm text-blue-400 underline"
+                    >
+                      Open IPFS gateway
+                    </a>
+                    <p className="mt-2 text-xs text-slate-500">
+                      This link is not an access-control mechanism. Anyone
+                      who obtains the CID may be able to retrieve the file.
+                    </p>
+                  </div>
+                )}
+
+                {issueSuccess && (
+                  <Message success>{issueSuccess}</Message>
+                )}
               </div>
-
-            </>
-
+            </div>
           )}
 
-          {/* =========================
-              HOLDER
-          ========================= */}
+          {/* HOLDER */}
           {activeTab === "holder" && (
-
-            <>
-
-              <div className="mb-8">
-
-                <div className="mb-3 inline-flex rounded-lg bg-green-500/10 px-3 py-1.5 text-xs font-semibold text-green-300">
-                  ROLE 02 · HOLDER
-                </div>
-
-                <h3 className="text-2xl font-bold">
-                  Manage consent
-                </h3>
-
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-
-                  Decide whether a specific Verifier
-                  is allowed to validate your credential.
-
-                </p>
-
-              </div>
+            <div>
+              <RoleHeading
+                label="ROLE 02 · HOLDER"
+                title="Manage consent"
+                description="Grant or revoke permission for a specific Verifier wallet to validate your credential."
+              />
 
               <div className="space-y-5">
-
-                {/* Verifier address */}
-                <div>
-
-                  <label className="mb-2 block text-sm font-semibold text-slate-300">
-                    Verifier Wallet Address
-                  </label>
-
+                <Field label="Verifier Wallet Address">
                   <input
                     type="text"
                     value={verifierAddress}
-                    onChange={(e) =>
-                      setVerifierAddress(
-                        e.target.value
-                      )
-                    }
+                    onChange={(e) => setVerifierAddress(e.target.value)}
                     placeholder="0x..."
-                    className="w-full rounded-xl border border-white/10 bg-[#070b14] px-4 py-3.5 font-mono text-sm outline-none transition placeholder:text-slate-600 focus:border-green-500/70 focus:ring-2 focus:ring-green-500/10"
+                    className={inputClass}
                   />
+                </Field>
 
-                </div>
-
-                {/* Consent buttons */}
                 <div className="grid gap-3 sm:grid-cols-2">
-
                   <button
-                    onClick={() =>
-                      handleConsent(true)
-                    }
+                    onClick={() => handleConsent(true)}
                     disabled={consentLoading}
-                    className="rounded-xl bg-green-600 px-5 py-3.5 font-semibold transition hover:bg-green-500 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-xl bg-green-600 px-5 py-3.5 font-semibold hover:bg-green-500 disabled:opacity-60"
                   >
-
-                    {consentLoading
-                      ? "Processing..."
-                      : "Give Consent"}
-
+                    {consentLoading ? "Processing..." : "Give Consent"}
                   </button>
 
                   <button
-                    onClick={() =>
-                      handleConsent(false)
-                    }
+                    onClick={() => handleConsent(false)}
                     disabled={consentLoading}
-                    className="rounded-xl border border-red-500/30 bg-red-500/10 px-5 py-3.5 font-semibold text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-xl border border-red-500/30 bg-red-500/10 px-5 py-3.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:opacity-60"
                   >
-
-                    {consentLoading
-                      ? "Processing..."
-                      : "Revoke Consent"}
-
+                    {consentLoading ? "Processing..." : "Revoke Consent"}
                   </button>
-
                 </div>
 
-                {/* Consent message */}
-                {consentMessage && (
-
-                  <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4 text-sm text-green-300">
-
-                    ✓ {consentMessage}
-
-                  </div>
-
-                )}
-
-                {/* Transaction */}
-                {transactionHash && (
-                  <TransactionBox
-                    hash={transactionHash}
-                  />
-                )}
-
+                {consentMessage && <Message success>{consentMessage}</Message>}
               </div>
-
-            </>
-
+            </div>
           )}
 
-          {/* =========================
-              VERIFIER
-          ========================= */}
+          {/* VERIFIER */}
           {activeTab === "verifier" && (
-
-            <>
-
-              <div className="mb-8">
-
-                <div className="mb-3 inline-flex rounded-lg bg-purple-500/10 px-3 py-1.5 text-xs font-semibold text-purple-300">
-                  ROLE 03 · VERIFIER
-                </div>
-
-                <h3 className="text-2xl font-bold">
-                  Verify a credential
-                </h3>
-
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-
-                  Upload the document to calculate its
-                  SHA-256 hash. The contract checks the
-                  hash and your consent status.
-
-                </p>
-
-              </div>
+            <div>
+              <RoleHeading
+                label="ROLE 03 · VERIFIER"
+                title="Verify a credential"
+                description="Select the document you received. Its Keccak-256 hash will be checked against the blockchain, along with your consent status."
+              />
 
               <div className="space-y-5">
-
-                {/* Holder address */}
-                <div>
-
-                  <label className="mb-2 block text-sm font-semibold text-slate-300">
-                    Holder Wallet Address
-                  </label>
-
+                <Field label="Holder Wallet Address">
                   <input
                     type="text"
                     value={verifyHolderAddress}
-                    onChange={(e) =>
-                      setVerifyHolderAddress(
-                        e.target.value
-                      )
-                    }
+                    onChange={(e) => setVerifyHolderAddress(e.target.value)}
                     placeholder="0x..."
-                    className="w-full rounded-xl border border-white/10 bg-[#070b14] px-4 py-3.5 font-mono text-sm outline-none transition placeholder:text-slate-600 focus:border-purple-500/70 focus:ring-2 focus:ring-purple-500/10"
+                    className={inputClass}
                   />
+                </Field>
 
-                </div>
+                <Field label="Document to Verify">
+                  <input
+                    type="file"
+                    onChange={(e) => {
+                      setVerifierFile(e.target.files?.[0] ?? null);
+                      setVerificationResult(null);
+                    }}
+                    className={fileClass}
+                  />
+                  <p className="mt-2 text-xs text-slate-500">
+                    Verification hashes the selected file locally. Select
+                    the exact original file.
+                  </p>
+                </Field>
 
-                {/* Document */}
-                <div>
-
-                  <label className="mb-2 block text-sm font-semibold text-slate-300">
-                    Document to Verify
-                  </label>
-
-                  <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-[#070b14] px-5 py-8 text-center transition hover:border-purple-500/50 hover:bg-purple-500/5">
-
-                    <span className="text-2xl">
-                      ⌕
-                    </span>
-
-                    <span className="mt-2 text-sm font-semibold text-slate-200">
-
-                      {verifierFile
-                        ? verifierFile.name
-                        : "Choose the document"}
-
-                    </span>
-
-                    <span className="mt-1 text-xs text-slate-500">
-                      Hashing happens locally in the browser.
-                    </span>
-
-                    <input
-                      type="file"
-                      onChange={(e) => {
-                        setVerifierFile(
-                          e.target.files?.[0] ||
-                            null
-                        );
-
-                        setVerificationResult(
-                          null
-                        );
-                      }}
-                      className="hidden"
-                    />
-
-                  </label>
-
-                </div>
-
-                {/* Verify button */}
                 <button
-                  onClick={
-                    handleVerifyCredential
-                  }
+                  onClick={handleVerifyCredential}
                   disabled={verifying}
-                  className="w-full rounded-xl bg-purple-600 px-5 py-3.5 font-semibold transition hover:bg-purple-500 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="w-full rounded-xl bg-purple-600 px-5 py-3.5 font-semibold hover:bg-purple-500 disabled:opacity-60"
                 >
-
-                  {verifying
-                    ? "Verifying..."
-                    : "Verify Credential"}
-
+                  {verifying ? "Verifying..." : "Verify Credential"}
                 </button>
 
-                {/* Valid */}
-                {verificationResult ===
-                  true && (
-
-                  <div className="rounded-2xl border border-green-500/30 bg-green-500/10 p-6">
-
-                    <div className="flex items-start gap-4">
-
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-green-500/15 text-lg text-green-400">
-                        ✓
-                      </div>
-
-                      <div>
-
-                        <p className="text-xl font-bold text-green-400">
-                          Credential Valid
-                        </p>
-
-                        <p className="mt-2 text-sm leading-6 text-green-300/80">
-
-                          The document hash matches the
-                          credential stored on-chain and
-                          the Holder has granted consent
-                          to this Verifier.
-
-                        </p>
-
-                      </div>
-
-                    </div>
-
-                  </div>
-
+                {verificationResult === true && (
+                  <Message success>
+                    Credential Valid — the document hash matches and the
+                    connected Verifier has consent from the Holder.
+                  </Message>
                 )}
 
-                {/* Invalid */}
-                {verificationResult ===
-                  false && (
-
-                  <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-6">
-
-                    <div className="flex items-start gap-4">
-
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-500/15 text-lg text-red-400">
-                        ×
-                      </div>
-
-                      <div>
-
-                        <p className="text-xl font-bold text-red-400">
-                          Credential Invalid
-                        </p>
-
-                        <p className="mt-2 text-sm leading-6 text-red-300/80">
-
-                          Verification failed. The document
-                          hash may not match, consent may
-                          have been revoked, or the credential
-                          may not be valid.
-
-                        </p>
-
-                      </div>
-
-                    </div>
-
-                  </div>
-
+                {verificationResult === false && (
+                  <Message>
+                    Credential Invalid — the hash may not match, the
+                    credential may be invalid, or Holder consent may be
+                    missing or revoked.
+                  </Message>
                 )}
-
               </div>
-
-            </>
-
+            </div>
           )}
 
+          {transactionHash && (
+            <div className="mt-6">
+              <TransactionBox hash={transactionHash} />
+            </div>
+          )}
         </div>
 
-        {/* =========================
-            PRIVACY NOTE
-        ========================= */}
-        <div className="mt-6 rounded-2xl border border-white/10 bg-slate-900/50 p-5 text-center">
-
-          <p className="text-xs leading-5 text-slate-500">
-
-            <span className="font-semibold text-slate-400">
-              Privacy note:
-            </span>{" "}
-
-            the original document is not uploaded to the
-            blockchain. Only its SHA-256 fingerprint is
-            used for verification.
-
-          </p>
-
+        <div className="mt-6 rounded-2xl border border-white/10 bg-slate-900/50 p-5 text-center text-xs leading-6 text-slate-400">
+          Privacy note: the document is stored off-chain on IPFS. The
+          current smart contract stores the document hash on-chain, not the
+          file or its IPFS CID. IPFS does not make uploaded files private.
         </div>
-
       </section>
 
-      {/* =========================
-          FOOTER
-      ========================= */}
       <footer className="border-t border-white/10 px-5 py-8 text-center text-xs text-slate-600">
-
-        e-KYC & Consent Vault · Sepolia Testnet ·
-        Smart contract deployed on Ethereum
-
+        e-KYC &amp; Consent Vault · Sepolia Testnet
       </footer>
-
     </main>
   );
 }
 
-// =========================
-// Transaction Component
-// =========================
+// Reusable UI components
 
-function TransactionBox({
-  hash,
+const inputClass =
+  "w-full rounded-xl border border-white/10 bg-[#070b14] px-4 py-3.5 font-mono text-sm outline-none placeholder:text-slate-600 focus:border-blue-500/70";
+
+const fileClass =
+  "block w-full rounded-xl border border-white/10 bg-[#070b14] p-3 text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-blue-600 file:px-4 file:py-2 file:font-semibold file:text-white";
+
+const primaryButton =
+  "w-full rounded-xl bg-blue-600 px-5 py-3.5 font-semibold transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60";
+
+function RoleHeading({
+  label,
+  title,
+  description,
 }: {
-  hash: string;
+  label: string;
+  title: string;
+  description: string;
 }) {
   return (
+    <div className="mb-8">
+      <div className="mb-3 inline-flex rounded-lg bg-blue-500/10 px-3 py-1.5 text-xs font-semibold text-blue-300">
+        {label}
+      </div>
+      <h3 className="text-2xl font-bold">{title}</h3>
+      <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
+        {description}
+      </p>
+    </div>
+  );
+}
 
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <label className="mb-2 block text-sm font-semibold text-slate-300">
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function ResultField({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="break-all rounded-xl border border-white/10 bg-[#070b14] p-4">
+      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </p>
+      <p className="mt-2 font-mono text-xs text-blue-300">{value}</p>
+    </div>
+  );
+}
+
+function Message({
+  children,
+  success = false,
+}: {
+  children: React.ReactNode;
+  success?: boolean;
+}) {
+  return (
+    <div
+      className={`rounded-xl border p-4 text-sm ${
+        success
+          ? "border-green-500/20 bg-green-500/10 text-green-300"
+          : "border-red-500/20 bg-red-500/10 text-red-300"
+      }`}
+    >
+      {children}
+    </div>
+  );
+}
+
+function TransactionBox({ hash }: { hash: string }) {
+  return (
     <div className="rounded-xl border border-white/10 bg-[#070b14] p-4">
-
       <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
         Transaction Hash
       </p>
-
       <a
         href={`https://sepolia.etherscan.io/tx/${hash}`}
         target="_blank"
         rel="noopener noreferrer"
-        className="mt-2 block break-all font-mono text-xs text-blue-400 underline decoration-blue-400/30 underline-offset-2 hover:text-blue-300"
+        className="mt-2 block break-all font-mono text-xs text-blue-400 underline"
       >
         {hash}
       </a>
-
     </div>
-
   );
 }

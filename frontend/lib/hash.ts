@@ -1,18 +1,13 @@
+
+import { keccak256 } from "ethers";
+
+/**
+ * Calculates the keccak256 hash of the exact file bytes.
+ * Returns a 0x-prefixed 32-byte hexadecimal string.
+ */
 export async function hashFile(file: File): Promise<string> {
   const fileBuffer = await file.arrayBuffer();
+  const fileBytes = new Uint8Array(fileBuffer);
 
-  const hashBuffer = await crypto.subtle.digest(
-    "SHA-256",
-    fileBuffer
-  );
-
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-
-  const hashHex =
-    "0x" +
-    hashArray
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-
-  return hashHex;
+  return keccak256(fileBytes);
 }
